@@ -131,16 +131,132 @@ console.log(cache.stats);
 
 ---
 
+## Multi-Instance Strategy
+
+BunCache is in-memory and process-specific, but you can still use it effectively in multi-instance deployments by layering it on top of a shared store. Below are three practical approaches.
+
+### Approach 1: Local Cache + Shared Database (Read-Through)
+
+Use BunCache as a local read cache in front of a shared database. Each instance caches hot data locally to reduce database load.
+
+```typescript
+import { BunCache } from "@nds-stack/bun-cache";
+// import { db } from "./db";  // bun:sqlite, Postgres, etc.
+
+const local = new BunCache({ maxKeys: 1000, defaultTTL: 60_000 });
+
+async function getUser(id: string): Promise<User | null> {
+  // 1. Check local cache (fast, ~4.5M ops/s)
+  const cached = local.get<User>(`user:${id}`);
+  if (cached) return cached;
+
+  // 2. Miss — read from shared database
+  const user = await db.query("SELECT * FROM users WHERE id = ?", [id]);
+
+  // 3. Populate local cache for next read
+  if (user) local.set(`user:${id}`, user, 60_000);
+
+  return user;
+}
+
+async function updateUser(id: string, data: Partial<User>): Promise<void> {
+  // 1. Write to shared database (source of truth)
+  await db.run("UPDATE users SET ... WHERE id = ?", [id, ...data]);
+
+  // 2. Invalidate local cache entry
+  local.delete(`user:${id}`);
+}
+```
+
+**Pros:** Simple, zero external infrastructure beyond your database.  
+**Cons:** Stale reads until TTL expires (unless you explicitly invalidate on write).
+
+### Approach 2: Local Cache + Redis (Cache-Aside with Invalidation)
+
+Use Redis as the shared cache layer, with BunCache as a local hot-cache to reduce Redis round-trips. Invalidation signals flow via Redis pub/sub.
+
+```typescript
+import { BunCache } from "@nds-stack/bun-cache";
+// import { redis } from "./redis";  // ioredis or bun-redis
+
+const local = new BunCache({ maxKeys: 5000, defaultTTL: 120_000 });
+
+async function getCached(key: string): Promise<string | null> {
+  // 1. Check local cache first
+  const hit = local.get<string>(key);
+  if (hit !== undefined) return hit;
+
+  // 2. Miss — check Redis
+  const value = await redis.get(key);
+  if (value !== null) {
+    local.set(key, value, 120_000); // populate local
+  }
+  return value;
+}
+
+async function setCached(key: string, value: string): Promise<void> {
+  // 1. Write to Redis (shared)
+  await redis.set(key, value, "EX", 3600);
+
+  // 2. Update local cache
+  local.set(key, value, 120_000);
+
+  // 3. Publish invalidation to other instances
+  await redis.publish("cache:invalidate", key);
+}
+
+// Subscribe to invalidation from other instances
+// redis.subscribe("cache:invalidate", (key) => local.delete(key));
+```
+
+**Pros:** Fast local reads, shared state via Redis, active invalidation across instances.  
+**Cons:** Requires Redis.
+
+### Approach 3: Local Cache + SQLite (via bunql)
+
+Use bunql (SQLite) as a shared persistence layer for process-local caching with cross-instance durability.
+
+```typescript
+import { BunCache } from "@nds-stack/bun-cache";
+// import { db } from "@nds-stack/bunql";
+
+const local = new BunCache({ maxKeys: 1000, defaultTTL: 30_000 });
+
+async function getSettings(key: string): Promise<Settings | null> {
+  const cached = local.get<Settings>(`settings:${key}`);
+  if (cached) return cached;
+
+  const row = db.query<Settings>(
+    "SELECT value FROM settings WHERE key = ?", [key]
+  );
+  if (row.rows.length > 0) {
+    local.set(`settings:${key}`, row.rows[0], 30_000);
+    return row.rows[0];
+  }
+  return null;
+}
+```
+
+### Which Approach to Choose
+
+| Scenario | Recommended | Why |
+|----------|-------------|-----|
+| You already have **Postgres/MySQL** | Approach 1 | No extra infra, cache-aside pattern |
+| You need **fast cross-instance invalidation** | Approach 2 | Redis pub/sub notifies all instances |
+| You want **Bun-native, zero infra** | Approach 3 | SQLite via bunql, multi-process reads |
+| **Single instance** | Just BunCache | No shared layer needed |
+
+> **Bottom line:** BunCache handles the local hot-cache layer. For cross-instance consistency, pair it with a shared store — BunCache makes your shared store faster by absorbing repeated reads.
+
+---
+
 ## Limitations
 
 - **In-memory only** — BunCache stores data in the current process memory. Data is lost when the process exits.
-- **Not shared across instances** — Each Bun process has its own isolated BunCache instance. Data is NOT synchronized between multiple application instances.
-- **For multi-instance consistency** — Use an external shared cache such as:
-  - **Redis** / **Memcached** — dedicated distributed cache
-  - **SQLite** via `@nds-stack/bunql` — embedded database for multi-process reads
-  - **PostgreSQL** / **MySQL** — if you already have a database layer
-- **No persistence** — BunCache is a pure in-memory cache. There is no file or database backing. For persistent caching, use a database or key-value store.
-- **Single-process only** — BunCache is designed for single-process Bun applications. For multi-process architectures, consider a client-server caching solution.
+- **No persistence** — BunCache is a pure in-memory cache. There is no file or database backing.
+- **Single-process design** — BunCache is designed for single-process Bun applications. For multi-instance consistency, use one of the strategies above.
+- **No distributed coordination** — BunCache does not implement distributed locking, leader election, or consensus protocols.
+- **LRU is O(n)** — Eviction scanning is O(cache size). For very large caches (>100K entries), consider an alternative eviction strategy.
 
 ---
 
