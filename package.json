@@ -1,6 +1,6 @@
 {
   "name": "@nds-stack/bun-cache",
-  "version": "0.1.0-alpha.0",
+  "version": "0.1.0-alpha.1",
   "description": "In-memory cache for Bun — TTL, LRU eviction, zero dependencies",
   "author": "nds-stack <nds.stack@gmail.com>",
   "type": "module",
@@ -21,7 +21,7 @@
     "typecheck:build": "tsc -p tsconfig.json --declaration --emitDeclarationOnly --outdir dist",
     "bench": "bun run bench/cache.bench.ts",
     "prepublishOnly": "bun run lint && bun run typecheck && bun test && bun run build",
-    "build": "bun build ./src/index.ts --outdir=./dist --target=bun --format=esm && tsc -p tsconfig.json --declaration --emitDeclarationOnly --outdir dist",
+    "build": "bun build ./src/index.ts --outdir=./dist --target=bun --format=esm && tsc -p tsconfig.build.json",
     "clean": "bun run --bun \"rm -rf dist\""
   },
   "files": [
