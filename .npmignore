@@ -1,0 +1,13 @@
+agents/
+AGENTS.md
+PROJECT.md
+RULES.md
+TODO.md
+CHANGELOG.md
+test/
+bench/
+examples/
+.eslintrc*
+tsconfig.json
+*.test.ts
+*.bench.ts
