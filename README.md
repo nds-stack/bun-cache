@@ -75,6 +75,75 @@ new BunCache(options?: BunCacheOptions)
 
 ---
 
+## Eviction & Expiration
+
+BunCache has two independent mechanisms for removing entries.
+
+### 1. TTL Expiration (Lazy)
+- Checked during `get()` and `has()` — not at `set()` time
+- If `entry.expiresAt` has passed, the entry is removed from the store
+- Fires `onExpire(key, value)` — does NOT count as an eviction (`stats.evictions` is not incremented)
+- No timers or intervals involved — **zero background overhead**
+- Expired entries remain in memory until the next `get()` or `has()` access
+
+### 2. LRU Eviction (When Full)
+- Triggered during `set()` when `this.#store.size >= maxKeys` and the key does not already exist
+- Scans all entries to find the one with the oldest `lastUsed` timestamp
+- Removes that entry, then inserts the new one
+- Fires `onEvict(key, value, "lru")` — increments `stats.evictions`
+- Manual `delete()` fires `onEvict(key, value, "manual")` — also increments `stats.evictions`
+
+### Interaction Between TTL and LRU
+- TTL and LRU are **independent mechanisms** that operate on separate code paths
+- A TTL-expired key is removed by `get()`/`has()` **before** LRU eviction ever considers it
+- LRU eviction does **not** check TTL — it only looks at `lastUsed`
+- When both are active and the cache is full:
+  1. Expired keys are cleaned lazily when accessed
+  2. If no expired keys are accessed, `set()` triggers LRU eviction for the least recently used entry
+- TTL expiration never increments `stats.evictions` — use `stats.expirations` to track TTL removals
+
+### Example: Both TTL and LRU Active
+
+```typescript
+import { BunCache } from "@nds-stack/bun-cache";
+
+const cache = new BunCache({ maxKeys: 3, defaultTTL: 5000 });
+
+cache.onExpire = (key, value) => console.log(`expired: ${key}=${value}`);
+cache.onEvict = (key, value, reason) => console.log(`evicted: ${key}=${value} (${reason})`);
+
+cache.set("a", 1);   // TTL: 5s
+cache.set("b", 2);   // TTL: 5s
+cache.set("c", 3);   // TTL: 5s
+
+cache.set("d", 4);   // maxKeys=3 exceeded → onEvict("a", 1, "lru")
+
+// After 5 seconds...
+cache.get("b");      // → undefined, onExpire("b", 2) fires
+cache.has("c");      // → false, onExpire("c", 3) fires
+
+// Stats after all operations:
+console.log(cache.stats);
+// { size: 1, hits: 0, misses: 2, evictions: 1, expirations: 2 }
+```
+
+> Note: `onEvict` fires for both LRU eviction (`reason: "lru"`) and manual delete (`reason: "manual"`). TTL expiration uses a separate callback — `onExpire`. If you need to track ALL removals, subscribe to both events.
+
+---
+
+## Limitations
+
+- **In-memory only** — BunCache stores data in the current process memory. Data is lost when the process exits.
+- **Not shared across instances** — Each Bun process has its own isolated BunCache instance. Data is NOT synchronized between multiple application instances.
+- **For multi-instance consistency** — Use an external shared cache such as:
+  - **Redis** / **Memcached** — dedicated distributed cache
+  - **SQLite** via `@nds-stack/bunql` — embedded database for multi-process reads
+  - **PostgreSQL** / **MySQL** — if you already have a database layer
+- **No persistence** — BunCache is a pure in-memory cache. There is no file or database backing. For persistent caching, use a database or key-value store.
+- **Single-process only** — BunCache is designed for single-process Bun applications. For multi-process architectures, consider a client-server caching solution.
+
+---
+
 ## Benchmarks
 
 Environment: Bun v1.3.13, 10,000 iterations × 3 samples.
