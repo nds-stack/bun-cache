@@ -91,7 +91,7 @@ BunCache has two independent mechanisms for removing entries.
 - Scans all entries to find the one with the oldest `lastUsed` timestamp
 - Removes that entry, then inserts the new one
 - Fires `onEvict(key, value, "lru")` — increments `stats.evictions`
-- Manual `delete()` fires `onEvict(key, value, "manual")` — also increments `stats.evictions`
+- Manual `delete()` fires `onEvict(key, value, "manual")` — does NOT increment `stats.evictions` (only LRU eviction counts)
 
 ### Interaction Between TTL and LRU
 - TTL and LRU are **independent mechanisms** that operate on separate code paths
@@ -247,6 +247,157 @@ async function getSettings(key: string): Promise<Settings | null> {
 | **Single instance** | Just BunCache | No shared layer needed |
 
 > **Bottom line:** BunCache handles the local hot-cache layer. For cross-instance consistency, pair it with a shared store — BunCache makes your shared store faster by absorbing repeated reads.
+
+---
+
+## Error Handling
+
+BunCache does not throw under normal use — it uses `undefined` returns and silent fallbacks:
+
+- **Cache miss:** `get()` returns `undefined` — no error thrown
+- **TTL expiration:** Expired entries are silently removed on next `get()`/`has()` — no error
+- **LRU eviction:** When the cache is full, the least recently used entry is silently evicted — no error
+
+### Edge Cases
+
+```typescript
+const cache = new BunCache({ maxKeys: 0, defaultTTL: 0 });
+
+// maxKeys: 0 = unlimited entries, never evicts
+cache.set("a", 1); // works, no limit enforced
+
+// TTL of 0 or negative treats as no expiry
+cache.set("b", 2, 0);
+cache.get("b"); // → 2, never expires
+
+// Missing key
+cache.get("nonexistent");  // → undefined
+cache.delete("nonexistent"); // → false
+```
+
+> **Design choice:** Silent failure keeps the API clean and predictable. If you need visibility into evictions or expirations, use the `onEvict` and `onExpire` callbacks or read `cache.stats`.
+
+---
+
+## Customization Guide
+
+### Wrap with Metrics
+
+```typescript
+import { BunCache } from "@nds-stack/bun-cache";
+
+class MonitoredCache<T> {
+  private cache = new BunCache<T>({ maxKeys: 1000, defaultTTL: 60_000 });
+
+  get(key: string): T | undefined {
+    const start = performance.now();
+    const value = this.cache.get(key);
+    metrics.record("cache.get", performance.now() - start);
+    return value;
+  }
+
+  set(key: string, value: T, ttl?: number): void {
+    this.cache.set(key, value, ttl);
+    metrics.increment("cache.set");
+  }
+
+  get stats() {
+    return this.cache.stats;
+  }
+}
+```
+
+### Add Event Emitter
+
+```typescript
+import { BunCache } from "@nds-stack/bun-cache";
+
+const cache = new BunCache({ maxKeys: 100, defaultTTL: 30_000 });
+
+cache.onEvict = (key, value, reason) => {
+  console.log(`[cache] evicted ${key} (${reason})`);
+};
+
+cache.onExpire = (key, value) => {
+  console.log(`[cache] expired ${key}`);
+};
+
+cache.onClear = () => {
+  console.log(`[cache] cleared`);
+};
+```
+
+### Early Refresh Pattern
+
+Proactively refresh cache entries before they expire:
+
+```typescript
+import { BunCache } from "@nds-stack/bun-cache";
+
+const cache = new BunCache<string>({ maxKeys: 100, defaultTTL: 60_000 });
+
+async function getOrRefresh(key: string, fetch: () => Promise<string>): Promise<string> {
+  const ttl = cache.remainingTTL(key);
+
+  // If TTL is below threshold, refresh in background
+  if (ttl > 0 && ttl < 10_000) {
+    fetch().then(value => cache.set(key, value)).catch(() => {});
+  }
+
+  const cached = cache.get(key);
+  if (cached !== undefined) return cached;
+
+  const fresh = await fetch();
+  cache.set(key, fresh);
+  return fresh;
+}
+```
+
+### Multi-Layer Cache
+
+```typescript
+import { BunCache } from "@nds-stack/bun-cache";
+
+// L1: Fast in-process cache (small, short TTL)
+const l1 = new BunCache<string>({ maxKeys: 100, defaultTTL: 1_000 });
+
+// L2: Larger in-process cache (longer TTL)
+const l2 = new BunCache<string>({ maxKeys: 10_000, defaultTTL: 60_000 });
+
+async function getCached(key: string, fetch: () => Promise<string>): Promise<string> {
+  // Check L1 first
+  const l1hit = l1.get(key);
+  if (l1hit !== undefined) return l1hit;
+
+  // Check L2
+  const l2hit = l2.get(key);
+  if (l2hit !== undefined) {
+    l1.set(key, l2hit, 1_000); // promote to L1
+    return l2hit;
+  }
+
+  // Miss — fetch from source
+  const value = await fetch();
+  l2.set(key, value);
+  return value;
+}
+```
+
+---
+
+## Comparison Table
+
+| Feature | Raw `Map` | `lru-cache` (npm) | `quick-lru` (npm) | bun-cache |
+|---------|-----------|-------------------|--------------------|-----------|
+| TTL support | ❌ Manual | ✅ | ❌ | ✅ |
+| LRU eviction | ❌ Manual | ✅ | ✅ | ✅ |
+| Events (onExpire, onEvict) | ❌ | ✅ | ❌ | ✅ |
+| Stats (hit/miss/eviction) | ❌ | ✅ | ❌ | ✅ |
+| Bun-native | ✅ | ❌ Polyfills | ❌ Polyfills | ✅ |
+| Zero dependencies | ✅ | ❌ | ❌ | ✅ |
+| Bundle size | 0KB | ~15KB + deps | ~3KB + deps | **~1KB** |
+| `maxKeys: 0` unlimited | ✅ | ❌ | ❌ | ✅ |
+| Lazy expiration (no timers) | ❌ | ❌ | ❌ | ✅ |
 
 ---
 

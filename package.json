@@ -1,6 +1,6 @@
 {
   "name": "@nds-stack/bun-cache",
-  "version": "0.1.0-alpha.2",
+  "version": "0.1.0-beta.0",
   "description": "In-memory cache for Bun — TTL, LRU eviction, zero dependencies",
   "author": "nds-stack <nds.stack@gmail.com>",
   "type": "module",

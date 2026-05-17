@@ -53,12 +53,19 @@ export class BunCache {
   }
 
   set<T>(key: string, value: T, ttl?: number): void {
+    if (typeof key !== "string") throw new TypeError("key must be a string");
+
     if (!this.#store.has(key) && this.#hasLimit && this.#store.size >= this.#maxKeys) {
       this.#evictLRU();
     }
 
     const resolvedTTL = ttl ?? this.#defaultTTL;
-    const expiresAt = resolvedTTL > 0 ? performance.now() + resolvedTTL : 0;
+    const effectiveTTL = Number.isFinite(resolvedTTL) && resolvedTTL >= 0 ? resolvedTTL : 0;
+    const expiresAt = effectiveTTL > 0 ? performance.now() + effectiveTTL : 0;
+
+    if (this.#hasLimit && this.#store.has(key)) {
+      this.#store.delete(key);
+    }
 
     this.#store.set(key, {
       value,
@@ -74,7 +81,7 @@ export class BunCache {
       return undefined;
     }
 
-    if (entry.expiresAt !== 0 && performance.now() > entry.expiresAt) {
+    if (this.#isExpired(entry)) {
       this.#store.delete(key);
       this.#expirations++;
       this.#misses++;
@@ -89,6 +96,8 @@ export class BunCache {
     this.#hits++;
     if (this.#hasLimit) {
       entry.lastUsed = performance.now();
+      this.#store.delete(key);
+      this.#store.set(key, entry);
     }
     return entry.value as T;
   }
@@ -97,9 +106,10 @@ export class BunCache {
     const entry = this.#store.get(key);
     if (!entry) return false;
 
-    if (entry.expiresAt !== 0 && performance.now() > entry.expiresAt) {
+    if (this.#isExpired(entry)) {
       this.#store.delete(key);
       this.#expirations++;
+      this.#misses++;
       try {
         this.#eventHandlers.onExpire?.(key, entry.value);
       } catch {
@@ -114,6 +124,17 @@ export class BunCache {
   remainingTTL(key: string): number {
     const entry = this.#store.get(key);
     if (!entry) return -1;
+
+    if (this.#isExpired(entry)) {
+      this.#store.delete(key);
+      this.#expirations++;
+      try {
+        this.#eventHandlers.onExpire?.(key, entry.value);
+      } catch {
+        // handler error — cache state already consistent
+      }
+      return -1;
+    }
 
     if (entry.expiresAt === 0) return -1;
 
@@ -140,16 +161,48 @@ export class BunCache {
     this.#misses = 0;
     this.#evictions = 0;
     this.#expirations = 0;
-    this.#eventHandlers.onClear?.();
+    try {
+      this.#eventHandlers.onClear?.();
+    } catch {
+      // handler error — cache state already consistent
+    }
+  }
+
+  #isExpired(entry: CacheEntry<unknown>): boolean {
+    return entry.expiresAt !== 0 && performance.now() > entry.expiresAt;
   }
 
   keys(): string[] {
-    return Array.from(this.#store.keys());
+    const keys: string[] = [];
+    for (const [key, entry] of this.#store) {
+      if (this.#isExpired(entry)) {
+        this.#store.delete(key);
+        this.#expirations++;
+        try {
+          this.#eventHandlers.onExpire?.(key, entry.value);
+        } catch {
+          // handler error — cache state already consistent
+        }
+        continue;
+      }
+      keys.push(key);
+    }
+    return keys;
   }
 
   values<T>(): T[] {
     const arr: T[] = [];
-    for (const entry of this.#store.values()) {
+    for (const [key, entry] of this.#store) {
+      if (this.#isExpired(entry)) {
+        this.#store.delete(key);
+        this.#expirations++;
+        try {
+          this.#eventHandlers.onExpire?.(key, entry.value);
+        } catch {
+          // handler error — cache state already consistent
+        }
+        continue;
+      }
       arr.push(entry.value as T);
     }
     return arr;
@@ -158,28 +211,29 @@ export class BunCache {
   entries<T>(): Array<{ key: string; value: T }> {
     const arr: Array<{ key: string; value: T }> = [];
     for (const [key, entry] of this.#store) {
+      if (this.#isExpired(entry)) {
+        this.#store.delete(key);
+        this.#expirations++;
+        try {
+          this.#eventHandlers.onExpire?.(key, entry.value);
+        } catch {
+          // handler error — cache state already consistent
+        }
+        continue;
+      }
       arr.push({ key, value: entry.value as T });
     }
     return arr;
   }
 
   #evictLRU(): void {
-    let oldestKey: string | null = null;
-    let oldestTime = Infinity;
-
-    for (const [key, entry] of this.#store) {
-      if (entry.lastUsed < oldestTime) {
-        oldestTime = entry.lastUsed;
-        oldestKey = key;
-      }
-    }
-
-    if (oldestKey) {
-      const entry = this.#store.get(oldestKey);
+    const oldestKey = this.#store.keys().next().value;
+    if (oldestKey !== undefined) {
+      const entry = this.#store.get(oldestKey)!;
       this.#store.delete(oldestKey);
       this.#evictions++;
       try {
-        this.#eventHandlers.onEvict?.(oldestKey, entry?.value, "lru");
+        this.#eventHandlers.onEvict?.(oldestKey, entry.value, "lru");
       } catch {
         // handler error — cache state already consistent (key removed)
       }
